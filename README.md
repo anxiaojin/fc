@@ -10,6 +10,7 @@
 - 支持 1P / 2P 键盘、触屏虚拟手柄、标准浏览器 Gamepad
 - 运行 / 暂停、重置、静音、全屏
 - 每个 ROM 独立保存 / 读取即时状态
+- 单机遇到 jsnes 不支持的 NES Mapper 时，会自动切到本地内置的 EmulatorJS / fceumm 兼容核心
 - 纯静态文件，可部署到 GitHub Pages、Cloudflare Pages、Vercel、Nginx 等静态空间
 
 ## 本地运行
@@ -53,6 +54,12 @@ http://你的电脑IP:8081/fc-online-emulator/
 第一台手机点“创建房间”，第二台手机输入房间码点“加入”。进入房间后，1P 或 2P 任意一台手机都可以点内置游戏或用“载入 ROM”上传 `.nes` 文件；同步服务会把 ROM 广播给另一台手机，两边加载完成后自动同步开始。
 
 公网在线版如果只单机游玩，可以直接把整个 `fc-online-emulator/` 目录上传到 GitHub Pages、Cloudflare Pages、Vercel 或任意静态空间。双手机同步需要把 `sync-server.js` 部署到支持 Node/WebSocket 的服务器。
+
+## ROM 兼容性
+
+默认模拟核心是 `jsnes`，用于单机和双手机同步。它支持常见 Mapper，例如 `0/1/2/3/4/5/7/11/34/38/66/94/140/180`。
+
+部分中文卡、学习卡、外星科技、南晶科技 ROM 会使用特殊 Mapper，例如 `163/74/241/176/199`。这些 ROM 在单机上传时会自动切到 `EmulatorJS / fceumm` 兼容核心打开。兼容核心暂时不接入当前房间同步逻辑，所以这类 ROM 目前只能单机玩。
 
 ## 键位
 

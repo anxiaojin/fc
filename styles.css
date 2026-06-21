@@ -333,6 +333,32 @@ body.sync-online #syncBadge {
   image-rendering: crisp-edges;
 }
 
+.compat-player {
+  position: relative;
+  z-index: 2;
+  width: 100%;
+  height: 100%;
+  overflow: hidden;
+  border-radius: 4px;
+  background: #050608;
+}
+
+.compat-player iframe {
+  width: 100%;
+  height: 100%;
+  display: block;
+  border: 0;
+  background: #050608;
+}
+
+body.compat-mode #screen {
+  display: none !important;
+}
+
+body.compat-mode .controllers {
+  display: none !important;
+}
+
 .side-panel {
   min-width: 0;
   align-self: stretch;

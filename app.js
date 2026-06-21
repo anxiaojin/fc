@@ -1,9 +1,10 @@
 const SCREEN_WIDTH = 256;
 const SCREEN_HEIGHT = 240;
-const APP_VERSION = "v20260621-pad-turbo-1";
+const APP_VERSION = "v20260621-compat-core-1";
 const TARGET_FPS = 60;
 const FRAME_TIME = 1000 / TARGET_FPS;
 const TURBO_INTERVAL_MS = 80;
+const EMULATORJS_DATA_PATH = "./vendor/emulatorjs/";
 const AUDIO_BUFFER_SIZE = 4096;
 const AUDIO_LATENCY = 1024;
 const LATENCY_PROBE_INTERVAL = 1500;
@@ -27,6 +28,9 @@ const ONLINE_CATCHUP_FRAMES_PER_TICK = 4;
 const AUTHORITATIVE_STATE_INTERVAL_FRAMES = 0;
 const STATE_HASH_INTERVAL_FRAMES = TARGET_FPS * 5;
 const FRAME_ACK_INTERVAL_FRAMES = 5;
+const JSNES_SUPPORTED_MAPPERS = new Set([
+  0, 1, 2, 3, 4, 5, 7, 11, 34, 38, 66, 94, 140, 180,
+]);
 
 const els = {
   romInput: document.querySelector("#romInput"),
@@ -41,6 +45,7 @@ const els = {
   gamepadText: document.querySelector("#gamepadText"),
   screen: document.querySelector("#screen"),
   screenWrap: document.querySelector(".screen-wrap"),
+  compatPlayer: document.querySelector("#compatPlayer"),
   romButtons: document.querySelectorAll(".rom-card"),
   createRoomButton: document.querySelector("#createRoomButton"),
   joinRoomButton: document.querySelector("#joinRoomButton"),
@@ -114,6 +119,8 @@ let currentRomKey = "";
 let audio = null;
 let currentRomData = null;
 let currentRoomRom = null;
+let compatObjectUrl = "";
+let compatFrame = null;
 
 const activeInputs = new Map();
 const keySources = new Map();
@@ -320,6 +327,12 @@ async function ensureUniqueClientToken() {
 
 function formatRomError(error) {
   const message = String(error?.message || error || "");
+  const mapper = error?.romInfo?.mapper;
+
+  if (error?.code === "JSNES_UNSUPPORTED_MAPPER" && mapper !== undefined) {
+    return `不支持 Mapper ${mapper}，单机可用兼容模式`;
+  }
+
   const mapperMatch = message.match(/mapper not supported by JSNES:\s*(.+)$/i);
 
   if (mapperMatch) {
@@ -335,6 +348,58 @@ function formatRomError(error) {
   }
 
   return "ROM 无法载入";
+}
+
+function makeRomError(message, code, romInfo = null) {
+  const error = new Error(message);
+  error.code = code;
+  if (romInfo) error.romInfo = romInfo;
+  return error;
+}
+
+function parseRomInfo(buffer) {
+  const bytes = new Uint8Array(buffer);
+  if (
+    bytes.length < 16 ||
+    bytes[0] !== 0x4e ||
+    bytes[1] !== 0x45 ||
+    bytes[2] !== 0x53 ||
+    bytes[3] !== 0x1a
+  ) {
+    throw makeRomError("Not an iNES ROM", "INVALID_ROM");
+  }
+
+  const flags6 = bytes[6];
+  const flags7 = bytes[7];
+  const nes20 = (flags7 & 0x0c) === 0x08;
+  let dirtyHeader = false;
+  for (let index = 8; index < 16; index += 1) {
+    if (bytes[index] !== 0) {
+      dirtyHeader = true;
+      break;
+    }
+  }
+
+  let mapper = (flags6 >> 4) | (flags7 & 0xf0);
+  if (dirtyHeader && !nes20) {
+    mapper &= 0x0f;
+  }
+
+  return {
+    chr8k: bytes[5],
+    dirtyHeader,
+    flags6,
+    flags7,
+    mapper,
+    nes20,
+    prg16k: bytes[4],
+    size: bytes.length,
+  };
+}
+
+function romMapperLabel(romInfo) {
+  if (!romInfo) return "Mapper ?";
+  return `Mapper ${romInfo.mapper}`;
 }
 
 function localSource(source) {
@@ -431,6 +496,7 @@ function updateSyncUi() {
 }
 
 function drawBootScreen() {
+  clearCompatMode();
   ctx.fillStyle = "#090a0d";
   ctx.fillRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
 
@@ -456,6 +522,107 @@ function renderFrame(frameBuffer) {
   }
   imageData.data.set(frameBuffer8);
   ctx.putImageData(imageData, 0, 0);
+}
+
+function clearCompatMode() {
+  if (compatObjectUrl) {
+    URL.revokeObjectURL(compatObjectUrl);
+    compatObjectUrl = "";
+  }
+  compatFrame = null;
+  els.compatPlayer?.replaceChildren();
+  if (els.compatPlayer) {
+    els.compatPlayer.hidden = true;
+  }
+  document.body.classList.remove("compat-mode");
+}
+
+function scriptJson(value) {
+  return JSON.stringify(value).replace(
+    /[<>&\u2028\u2029]/g,
+    (char) =>
+      ({
+        "<": "\\u003c",
+        ">": "\\u003e",
+        "&": "\\u0026",
+        "\u2028": "\\u2028",
+        "\u2029": "\\u2029",
+      })[char],
+  );
+}
+
+function buildCompatHtml(gameUrl, label) {
+  const dataUrl = new URL(EMULATORJS_DATA_PATH, window.location.href).href;
+  const safeLabel = scriptJson(label || "NES ROM");
+  const safeGameUrl = scriptJson(gameUrl);
+  const safeDataUrl = scriptJson(dataUrl);
+
+  return `<!doctype html>
+<html>
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+      html, body, #game {
+        width: 100%;
+        height: 100%;
+        margin: 0;
+        overflow: hidden;
+        background: #050608;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="game"></div>
+    <script>
+      window.EJS_player = "#game";
+      window.EJS_core = "nes";
+      window.EJS_gameUrl = ${safeGameUrl};
+      window.EJS_gameName = ${safeLabel};
+      window.EJS_pathtodata = ${safeDataUrl};
+      window.EJS_color = "#d84035";
+      window.EJS_startOnLoaded = true;
+      window.EJS_threads = false;
+      window.EJS_forceLegacyCores = true;
+      window.EJS_disableAutoLang = true;
+      window.EJS_startButtonName = "开始";
+      window.EJS_alignStartButton = "center";
+      window.EJS_onGameStart = function () {
+        parent.postMessage({ type: "fc-compat-started" }, "*");
+      };
+    </script>
+    <script src="${dataUrl}loader.js"></script>
+  </body>
+</html>`;
+}
+
+async function loadCompatRomBuffer(buffer, label, romInfo = null) {
+  if (!els.compatPlayer) {
+    throw makeRomError("Compatibility player unavailable", "COMPAT_UNAVAILABLE");
+  }
+
+  stopEmulation("切换兼容模式");
+  releaseAllInputs();
+  clearCompatMode();
+  audio?.reset();
+  nes = null;
+  running = false;
+  currentRomData = null;
+  currentRoomRom = null;
+
+  compatObjectUrl = URL.createObjectURL(
+    new Blob([buffer], { type: "application/octet-stream" }),
+  );
+  compatFrame = document.createElement("iframe");
+  compatFrame.title = label || "NES";
+  compatFrame.allow = "autoplay; fullscreen; gamepad";
+  compatFrame.allowFullscreen = true;
+  compatFrame.srcdoc = buildCompatHtml(compatObjectUrl, label);
+  els.compatPlayer.hidden = false;
+  els.compatPlayer.replaceChildren(compatFrame);
+  document.body.classList.add("has-game", "compat-mode");
+  updateControls(false);
+  setStatus(`兼容模式 ${romMapperLabel(romInfo)}`);
 }
 
 function createAudio(sampleRate = 44100) {
@@ -903,29 +1070,42 @@ function fetchRomBuffer(url) {
 }
 
 async function loadRomBuffer(buffer, label, options = {}) {
-  const { autoStart = true, status = label } = options;
-  const bytes = new Uint8Array(buffer);
-  if (
-    bytes.length < 16 ||
-    bytes[0] !== 0x4e ||
-    bytes[1] !== 0x45 ||
-    bytes[2] !== 0x53 ||
-    bytes[3] !== 0x1a
-  ) {
-    throw new Error("Not an iNES ROM");
+  const { allowCompat = false, autoStart = true, status = label } = options;
+  const romInfo = parseRomInfo(buffer);
+
+  if (!JSNES_SUPPORTED_MAPPERS.has(romInfo.mapper)) {
+    if (allowCompat) {
+      await loadCompatRomBuffer(buffer, label, romInfo);
+      return { compat: true, romInfo };
+    }
+    throw makeRomError(
+      `This ROM uses a mapper not supported by JSNES: ${romMapperLabel(romInfo)}`,
+      "JSNES_UNSUPPORTED_MAPPER",
+      romInfo,
+    );
   }
 
   const romData = bufferToBinaryString(buffer);
   currentRomData = romData;
   audio?.reset();
   nes = makeNes();
-  nes.loadROM(romData);
+  try {
+    nes.loadROM(romData);
+  } catch (error) {
+    if (allowCompat) {
+      await loadCompatRomBuffer(buffer, label, romInfo);
+      return { compat: true, romInfo };
+    }
+    throw error;
+  }
+  clearCompatMode();
   document.body.classList.add("has-game");
   updateControls(true);
   setStatus(status);
   if (autoStart) {
     startEmulation();
   }
+  return { compat: false, romInfo };
 }
 
 function rememberCurrentRomFromBuffer(buffer, label) {
@@ -972,8 +1152,12 @@ async function loadRomFile(file) {
   try {
     void resumeAudio();
     const buffer = await file.arrayBuffer();
-    await loadRomBuffer(buffer, file.name);
-    rememberCurrentRomFromBuffer(buffer, file.name);
+    const result = await loadRomBuffer(buffer, file.name, {
+      allowCompat: true,
+    });
+    if (!result.compat) {
+      rememberCurrentRomFromBuffer(buffer, file.name);
+    }
   } catch (error) {
     console.error(error);
     nes = null;
@@ -1005,8 +1189,12 @@ async function loadBundledRom(url, label) {
     void resumeAudio();
     const buffer = await fetchRomBuffer(url);
     setRomKeyFromLabel(label, buffer.byteLength);
-    await loadRomBuffer(buffer, label);
-    rememberCurrentRomFromUrl(url, label);
+    const result = await loadRomBuffer(buffer, label, {
+      allowCompat: true,
+    });
+    if (!result.compat) {
+      rememberCurrentRomFromUrl(url, label);
+    }
   } catch (error) {
     console.error(error);
     nes = null;
@@ -1390,15 +1578,13 @@ async function selectRoomRomFile(file) {
 
   try {
     const buffer = await file.arrayBuffer();
-    const bytes = new Uint8Array(buffer);
-    if (
-      bytes.length < 16 ||
-      bytes[0] !== 0x4e ||
-      bytes[1] !== 0x45 ||
-      bytes[2] !== 0x53 ||
-      bytes[3] !== 0x1a
-    ) {
-      throw new Error("Not an iNES ROM");
+    const romInfo = parseRomInfo(buffer);
+    if (!JSNES_SUPPORTED_MAPPERS.has(romInfo.mapper)) {
+      throw makeRomError(
+        `Online sync does not support ${romMapperLabel(romInfo)}`,
+        "JSNES_UNSUPPORTED_MAPPER",
+        romInfo,
+      );
     }
 
     rememberCurrentRomFromBuffer(buffer, file.name);
@@ -2579,7 +2765,16 @@ function bindUi() {
 	  window.addEventListener("focus", () => {
 	    handlePageResume();
 	  });
-	  window.addEventListener("pagehide", handlePageHide);
+  window.addEventListener("pagehide", handlePageHide);
+  window.addEventListener("message", (event) => {
+    if (
+      compatFrame &&
+      event.source === compatFrame.contentWindow &&
+      event.data?.type === "fc-compat-started"
+    ) {
+      setStatus("兼容模式运行中");
+    }
+  });
 
   els.createRoomButton.addEventListener("click", createRoom);
   els.joinRoomButton.addEventListener("click", () => joinRoom());
