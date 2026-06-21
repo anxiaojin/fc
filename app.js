@@ -1,6 +1,6 @@
 const SCREEN_WIDTH = 256;
 const SCREEN_HEIGHT = 240;
-const APP_VERSION = "v20260621-compat-core-1";
+const APP_VERSION = "v20260621-compat-core-2";
 const TARGET_FPS = 60;
 const FRAME_TIME = 1000 / TARGET_FPS;
 const TURBO_INTERVAL_MS = 80;
@@ -584,7 +584,7 @@ function buildCompatHtml(gameUrl, label) {
       window.EJS_startOnLoaded = true;
       window.EJS_threads = false;
       window.EJS_forceLegacyCores = true;
-      window.EJS_disableAutoLang = true;
+      window.EJS_disableAutoLang = false;
       window.EJS_startButtonName = "开始";
       window.EJS_alignStartButton = "center";
       window.EJS_onGameStart = function () {
