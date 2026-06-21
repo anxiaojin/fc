@@ -355,10 +355,6 @@ body.compat-mode #screen {
   display: none !important;
 }
 
-body.compat-mode .controllers {
-  display: none !important;
-}
-
 .side-panel {
   min-width: 0;
   align-self: stretch;

@@ -1,6 +1,6 @@
 const SCREEN_WIDTH = 256;
 const SCREEN_HEIGHT = 240;
-const APP_VERSION = "v20260621-compat-core-3";
+const APP_VERSION = "v20260621-compat-core-4";
 const TARGET_FPS = 60;
 const FRAME_TIME = 1000 / TARGET_FPS;
 const TURBO_INTERVAL_MS = 80;
@@ -75,6 +75,16 @@ const BUTTONS = {
   DOWN: NesButton?.BUTTON_DOWN,
   LEFT: NesButton?.BUTTON_LEFT,
   RIGHT: NesButton?.BUTTON_RIGHT,
+};
+const COMPAT_BUTTONS = {
+  A: 8,
+  B: 0,
+  SELECT: 2,
+  START: 3,
+  UP: 4,
+  DOWN: 5,
+  LEFT: 6,
+  RIGHT: 7,
 };
 const BUTTON_ORDER = ["A", "B", "SELECT", "START", "UP", "DOWN", "LEFT", "RIGHT"];
 const BUTTON_MASKS = Object.fromEntries(
@@ -549,6 +559,27 @@ function clearCompatMode() {
   document.body.classList.remove("compat-mode");
 }
 
+function isCompatModeActive() {
+  return Boolean(compatFrame && document.body.classList.contains("compat-mode"));
+}
+
+function sendCompatInput(player, button, isDown) {
+  if (!compatFrame?.contentWindow || COMPAT_BUTTONS[button] === undefined) {
+    return;
+  }
+
+  compatFrame.contentWindow.postMessage(
+    {
+      type: "fc-compat-input",
+      button,
+      down: isDown,
+      input: COMPAT_BUTTONS[button],
+      player,
+    },
+    "*",
+  );
+}
+
 function scriptJson(value) {
   return JSON.stringify(value).replace(
     /[<>&\u2028\u2029]/g,
@@ -599,8 +630,25 @@ function buildCompatHtml(gameUrl, label) {
       window.EJS_disableAutoLang = false;
       window.EJS_startButtonName = "开始";
       window.EJS_alignStartButton = "center";
+      const compatPendingInputs = [];
+      const applyCompatInput = function (payload) {
+        if (!Number.isFinite(Number(payload.input))) return;
+        const manager = window.EJS_emulator && window.EJS_emulator.gameManager;
+        if (!manager || typeof manager.simulateInput !== "function") {
+          compatPendingInputs.push(payload);
+          return;
+        }
+        const player = Math.max(0, Math.min(3, Number(payload.player || 1) - 1));
+        manager.simulateInput(player, Number(payload.input), payload.down ? 1 : 0);
+      };
+      window.addEventListener("message", function (event) {
+        const payload = event.data || {};
+        if (payload.type !== "fc-compat-input") return;
+        applyCompatInput(payload);
+      });
       window.EJS_onGameStart = function () {
         parent.postMessage({ type: "fc-compat-started" }, "*");
+        compatPendingInputs.splice(0).forEach(applyCompatInput);
       };
     </script>
     <script src="${dataUrl}loader.js"></script>
@@ -872,6 +920,11 @@ function setButton(player, button, isDown, source, options = {}) {
     syncButtonVisual(player, button, isActive);
   }
 
+  if (isCompatModeActive()) {
+    sendCompatInput(player, button, isActive);
+    return;
+  }
+
   if (!nes || BUTTONS[button] === undefined) {
     return;
   }
@@ -955,7 +1008,9 @@ function releaseAllInputs() {
     const [player, button] = inputKey.split(":");
     sources.clear();
     syncButtonVisual(player, button, false);
-    if (nes && BUTTONS[button] !== undefined) {
+    if (isCompatModeActive()) {
+      sendCompatInput(Number(player), button, false);
+    } else if (nes && BUTTONS[button] !== undefined) {
       nes.buttonUp(Number(player), BUTTONS[button]);
     }
   }
