@@ -1,0 +1,186 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>FC 在线模拟器</title>
+    <link rel="stylesheet" href="./styles.css?v=20260621-pad-turbo-1" />
+  </head>
+  <body>
+    <main class="app-shell">
+      <section class="stage" aria-label="FC 在线模拟器">
+        <header class="topbar">
+          <div>
+            <p class="kicker">FC / NES</p>
+            <h1>在线模拟器</h1>
+            <small id="versionLabel" class="version-label">v-dev</small>
+          </div>
+          <div class="actions" role="toolbar" aria-label="模拟器工具">
+            <label class="tool-button primary" title="载入 ROM">
+              <input id="romInput" type="file" accept=".nes,application/octet-stream" />
+              <span>载入 ROM</span>
+            </label>
+            <button id="runButton" class="tool-button" type="button" title="运行 / 暂停" disabled>▶</button>
+            <button id="resetButton" class="tool-button" type="button" title="重置游戏" disabled>↻</button>
+            <button id="muteButton" class="tool-button" type="button" title="静音">🔈</button>
+            <button id="saveButton" class="tool-button" type="button" title="保存即时状态" disabled>⬇</button>
+            <button id="loadButton" class="tool-button" type="button" title="读取即时状态" disabled>⬆</button>
+            <button id="fullscreenButton" class="tool-button" type="button" title="全屏">⛶</button>
+          </div>
+        </header>
+
+        <section class="sync-panel" aria-label="双手机同步房间">
+          <div class="sync-display">
+            <span id="syncBadge">本机</span>
+            <strong id="syncRoomLabel">双手机同步</strong>
+            <small id="syncRoleLabel">未进入房间</small>
+          </div>
+          <div class="sync-controls">
+            <button id="createRoomButton" class="sync-button" type="button">创建房间</button>
+            <input
+              id="roomInput"
+              class="room-input"
+              type="text"
+              inputmode="latin"
+              autocomplete="off"
+              maxlength="4"
+              placeholder="房间码"
+              aria-label="房间码"
+            />
+            <button id="joinRoomButton" class="sync-button" type="button">加入</button>
+            <button id="leaveRoomButton" class="sync-button ghost" type="button" hidden>离开</button>
+          </div>
+        </section>
+
+        <section class="library" aria-label="在线游戏列表">
+          <button
+            class="rom-card"
+            type="button"
+            data-rom-url="./roms/falling.nes"
+            data-rom-title="Falling"
+          >
+            <span>动作</span>
+            <strong>Falling</strong>
+          </button>
+          <button
+            class="rom-card"
+            type="button"
+            data-rom-url="./roms/nes-waveforms.nes"
+            data-rom-title="NES Waveforms"
+          >
+            <span>音乐</span>
+            <strong>NES Waveforms</strong>
+          </button>
+          <button
+            class="rom-card"
+            type="button"
+            data-rom-url="./roms/nes-apu-square-player.nes"
+            data-rom-title="APU Square Player"
+          >
+            <span>测试</span>
+            <strong>APU Square</strong>
+          </button>
+          <button
+            class="rom-card"
+            type="button"
+            data-rom-url="./roms/nes-apu-noise-player.nes"
+            data-rom-title="APU Noise Player"
+          >
+            <span>测试</span>
+            <strong>APU Noise</strong>
+          </button>
+        </section>
+
+        <div class="cabinet">
+          <section class="screen-wrap" aria-label="游戏画面">
+            <canvas id="screen" width="256" height="240"></canvas>
+          </section>
+
+          <aside class="side-panel" aria-label="状态面板">
+            <div class="status-row">
+              <span>状态</span>
+              <strong id="statusText">等待 ROM</strong>
+            </div>
+            <div class="status-row">
+              <span>帧率</span>
+              <strong id="fpsText">--</strong>
+            </div>
+            <div class="status-row">
+              <span>手柄</span>
+              <strong id="gamepadText">未连接</strong>
+            </div>
+
+            <div class="mapping">
+              <h2>键位</h2>
+              <div class="map-grid">
+                <span>1P</span>
+                <b>WASD</b>
+                <b>J / K</b>
+                <b>U / I</b>
+                <span>2P</span>
+                <b>方向键</b>
+                <b>N / M</b>
+                <b>, / .</b>
+              </div>
+            </div>
+          </aside>
+        </div>
+      </section>
+
+      <section class="controllers" aria-label="双人虚拟手柄">
+        <article class="pad" data-player="1">
+          <div class="pad-title">
+            <span>PLAYER 1</span>
+            <b>1P</b>
+          </div>
+          <div class="pad-body">
+            <div class="dpad" aria-label="1P 方向键">
+              <button data-button="UP" title="上" aria-label="上">▲</button>
+              <button data-button="LEFT" title="左" aria-label="左">◀</button>
+              <button data-button="RIGHT" title="右" aria-label="右">▶</button>
+              <button data-button="DOWN" title="下" aria-label="下">▼</button>
+            </div>
+            <div class="system-buttons">
+              <button data-button="SELECT" title="副开始" aria-label="副开始">SELECT</button>
+              <button data-button="START" title="开始" aria-label="开始">START</button>
+            </div>
+            <div class="face-buttons" aria-label="1P A/B">
+              <button data-button="B" data-turbo="true" title="B 连发" aria-label="B 连发">连B</button>
+              <button data-button="A" data-turbo="true" title="A 连发" aria-label="A 连发">连A</button>
+              <button data-button="B" title="B" aria-label="B">B</button>
+              <button data-button="A" title="A" aria-label="A">A</button>
+            </div>
+          </div>
+        </article>
+
+        <article class="pad" data-player="2">
+          <div class="pad-title">
+            <span>PLAYER 2</span>
+            <b>2P</b>
+          </div>
+          <div class="pad-body">
+            <div class="dpad" aria-label="2P 方向键">
+              <button data-button="UP" title="上" aria-label="上">▲</button>
+              <button data-button="LEFT" title="左" aria-label="左">◀</button>
+              <button data-button="RIGHT" title="右" aria-label="右">▶</button>
+              <button data-button="DOWN" title="下" aria-label="下">▼</button>
+            </div>
+            <div class="system-buttons">
+              <button data-button="SELECT" title="副开始" aria-label="副开始">SELECT</button>
+              <button data-button="START" title="开始" aria-label="开始">START</button>
+            </div>
+            <div class="face-buttons" aria-label="2P A/B">
+              <button data-button="B" data-turbo="true" title="B 连发" aria-label="B 连发">连B</button>
+              <button data-button="A" data-turbo="true" title="A 连发" aria-label="A 连发">连A</button>
+              <button data-button="B" title="B" aria-label="B">B</button>
+              <button data-button="A" title="A" aria-label="A">A</button>
+            </div>
+          </div>
+        </article>
+      </section>
+    </main>
+
+    <script src="./vendor/jsnes.min.js"></script>
+    <script src="./app.js?v=20260621-pad-turbo-1"></script>
+  </body>
+</html>
