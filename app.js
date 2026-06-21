@@ -1,6 +1,6 @@
 const SCREEN_WIDTH = 256;
 const SCREEN_HEIGHT = 240;
-const APP_VERSION = "v20260621-compat-core-2";
+const APP_VERSION = "v20260621-compat-core-3";
 const TARGET_FPS = 60;
 const FRAME_TIME = 1000 / TARGET_FPS;
 const TURBO_INTERVAL_MS = 80;
@@ -329,6 +329,10 @@ function formatRomError(error) {
   const message = String(error?.message || error || "");
   const mapper = error?.romInfo?.mapper;
 
+  if (error?.code === "JSNES_COMPAT_REQUIRED" && mapper !== undefined) {
+    return `该 ROM 需要兼容模式，联机暂不支持 ${romMapperLabel(error.romInfo)}`;
+  }
+
   if (error?.code === "JSNES_UNSUPPORTED_MAPPER" && mapper !== undefined) {
     return `不支持 Mapper ${mapper}，单机可用兼容模式`;
   }
@@ -400,6 +404,14 @@ function parseRomInfo(buffer) {
 function romMapperLabel(romInfo) {
   if (!romInfo) return "Mapper ?";
   return `Mapper ${romInfo.mapper}`;
+}
+
+function requiresCompatCore(romInfo) {
+  if (!romInfo) return false;
+
+  // jsnes maps CHR-RAM UxROM games as supported, but some of them render a
+  // blank/solid screen because pattern table writes are not reflected correctly.
+  return romInfo.mapper === 2 && romInfo.chr8k === 0;
 }
 
 function localSource(source) {
@@ -1073,6 +1085,18 @@ async function loadRomBuffer(buffer, label, options = {}) {
   const { allowCompat = false, autoStart = true, status = label } = options;
   const romInfo = parseRomInfo(buffer);
 
+  if (requiresCompatCore(romInfo)) {
+    if (allowCompat) {
+      await loadCompatRomBuffer(buffer, label, romInfo);
+      return { compat: true, romInfo };
+    }
+    throw makeRomError(
+      `This ROM requires the compatibility core: ${romMapperLabel(romInfo)}`,
+      "JSNES_COMPAT_REQUIRED",
+      romInfo,
+    );
+  }
+
   if (!JSNES_SUPPORTED_MAPPERS.has(romInfo.mapper)) {
     if (allowCompat) {
       await loadCompatRomBuffer(buffer, label, romInfo);
@@ -1579,6 +1603,16 @@ async function selectRoomRomFile(file) {
   try {
     const buffer = await file.arrayBuffer();
     const romInfo = parseRomInfo(buffer);
+    if (requiresCompatCore(romInfo)) {
+      throw makeRomError(
+        `Online sync does not support compatibility-core ROMs: ${romMapperLabel(
+          romInfo,
+        )}`,
+        "JSNES_COMPAT_REQUIRED",
+        romInfo,
+      );
+    }
+
     if (!JSNES_SUPPORTED_MAPPERS.has(romInfo.mapper)) {
       throw makeRomError(
         `Online sync does not support ${romMapperLabel(romInfo)}`,
