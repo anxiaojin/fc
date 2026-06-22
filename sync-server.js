@@ -9,7 +9,7 @@ const { URL } = require("url");
 const PORT = Number(process.env.PORT || getArg("--port") || 8081);
 const HOST = process.env.HOST || getArg("--host") || "0.0.0.0";
 const ROOT = path.resolve(__dirname, "..");
-const APP_VERSION = "v20260621-compat-core-4";
+const APP_VERSION = "v20260621-compat-state-3";
 const FRAME_TIME_MS = 1000 / 60;
 const FRAME_TIMER_MS = 16;
 const INPUT_GUARD_FRAMES = 1;
@@ -23,6 +23,7 @@ const HEARTBEAT_INTERVAL_MS = 5000;
 const CLIENT_TIMEOUT_MS = 18000;
 const STATE_REQUEST_TIMEOUT_MS = 3000;
 const INPUT_HISTORY_FRAMES = 60 * 20;
+const MAX_STATE_STRING_BYTES = 16 * 1024 * 1024;
 const ROOM_LEAD_BUFFER_FRAMES = 12;
 const MIN_STALL_RESUME_BACKLOG_FRAMES = 4;
 const STALL_RESUME_BACKLOG_RATIO = 0.5;
@@ -405,6 +406,7 @@ function sendLatestRoomState(client, room, options = {}) {
     type: "state",
     authoritative: Boolean(room.latestState.authoritative),
     cached: true,
+    core: room.latestState.core || room.currentRom?.core || "jsnes",
     frame,
     from: room.latestState.from,
     fromRole: room.latestState.fromRole || 0,
@@ -456,6 +458,7 @@ function cacheRoomState(room, stateMessage) {
     frame: room.latestState.frame,
     from: stateMessage.from,
     fromRole: stateMessage.fromRole || 0,
+    core: stateMessage.core || room.currentRom?.core || "jsnes",
     reason: stateMessage.reason,
     room: roomLogInfo(room),
     stateSeq: room.latestState.stateSeq,
@@ -517,6 +520,33 @@ function getRoom(code) {
 function normalizeClientToken(token) {
   const value = String(token || "").trim();
   return CLIENT_TOKEN_RE.test(value) ? value : "";
+}
+
+function normalizeCore(core) {
+  return core === "compat" ? "compat" : "jsnes";
+}
+
+function validStatePayload(state) {
+  if (!state) return false;
+  if (typeof state === "string") {
+    return Buffer.byteLength(state, "utf8") <= MAX_STATE_STRING_BYTES;
+  }
+  return typeof state === "object";
+}
+
+function isCompatLiveStateReason(reason) {
+  const value = String(reason || "");
+  return (
+    value === "compat-ready" ||
+    value === "hash-mismatch" ||
+    value === "hidden" ||
+    value === "history-gap" ||
+    value === "join" ||
+    value === "left" ||
+    value === "resume" ||
+    value === "resync" ||
+    value.startsWith("compat-input")
+  );
 }
 
 function createRoom() {
@@ -690,6 +720,7 @@ function alignRoomToState(room, stateMessage) {
 
 function roomRomFromMessage(message) {
   const label = String(message.label || "ROM");
+  const core = normalizeCore(message.core);
   if (message.mode === "data" || message.data) {
     const data = String(message.data || "");
     const size = Number(message.size || 0);
@@ -697,6 +728,7 @@ function roomRomFromMessage(message) {
       return null;
     }
     return {
+      core,
       data,
       label,
       mode: "data",
@@ -707,6 +739,7 @@ function roomRomFromMessage(message) {
   const url = String(message.url || "");
   if (!url) return null;
   return {
+    core,
     label,
     mode: "url",
     url,
@@ -722,6 +755,7 @@ function setRoomRom(room, rom) {
   resetRoomSync(room);
   for (const peer of room.clients) peer.ready = false;
   logSync("room-rom", {
+    core: room.currentRom.core || "jsnes",
     mode: room.currentRom.mode,
     label: room.currentRom.label,
     room: roomLogInfo(room),
@@ -1125,6 +1159,7 @@ function broadcastRoomState(room) {
 
   const currentRom = room.currentRom
     ? {
+        core: room.currentRom.core || "jsnes",
         label: room.currentRom.label,
         mode: room.currentRom.mode,
         size: room.currentRom.size || 0,
@@ -1341,11 +1376,13 @@ function handleMessage(client, raw) {
 
     logSync("client-select-rom", {
       client: clientLogInfo(client),
+      core: normalizeCore(message.core),
       label: String(message.label || "ROM"),
       room: roomLogInfo(room),
       url: String(message.url || ""),
     });
     setRoomRom(room, {
+      core: normalizeCore(message.core),
       mode: "url",
       url: String(message.url || ""),
       label: String(message.label || "ROM"),
@@ -1368,11 +1405,13 @@ function handleMessage(client, raw) {
 
     logSync("client-select-rom-data", {
       client: clientLogInfo(client),
+      core: normalizeCore(message.core),
       label: String(message.label || "ROM"),
       room: roomLogInfo(room),
       size,
     });
     setRoomRom(room, {
+      core: normalizeCore(message.core),
       data,
       label: String(message.label || "ROM"),
       mode: "data",
@@ -1471,25 +1510,39 @@ function handleMessage(client, raw) {
   }
 
   if (message.type === "state" && client.role > 0) {
-    if (!message.state || typeof message.state !== "object") return;
+    if (!validStatePayload(message.state)) return;
 
     const reason = String(message.reason || "resync");
+    const core = normalizeCore(message.core || room.currentRom?.core);
+    const compatState = core === "compat";
+    const compatLiveState = compatState && isCompatLiveStateReason(reason);
     const targetClient = roomClientById(room, String(message.to || ""));
     logSync("client-state", {
       client: clientLogInfo(client),
+      core,
       frame: Math.max(0, Math.floor(Number(message.frame) || 0)),
       reason,
       room: roomLogInfo(room),
+      stateBytes:
+        typeof message.state === "string"
+          ? Buffer.byteLength(message.state, "utf8")
+          : 0,
+      stateType: typeof message.state,
       target: clientLogInfo(targetClient),
     });
-    const realign = Boolean(room.paused || room.resumeAfterState);
-    const authoritative = client.role === 1;
+    const realign = Boolean(
+      room.paused ||
+        room.resumeAfterState ||
+        compatLiveState,
+    );
+    const authoritative = compatLiveState || client.role === 1;
     const stateMessage = {
       type: "state",
       authoritative,
       frame: Math.max(0, Math.floor(Number(message.frame) || 0)),
       from: client.id,
       fromRole: client.role,
+      core,
       realign,
       reason,
       state: message.state,
@@ -1517,7 +1570,10 @@ function handleMessage(client, raw) {
         });
       }
     }
-    if (reason !== "background" && reason !== "checkpoint") {
+    const shouldSendLiveState = compatState
+      ? compatLiveState
+      : reason !== "background" && reason !== "checkpoint";
+    if (shouldSendLiveState) {
       const outgoingState = {
         ...room.latestState,
         inputDelayMs: Math.round(room.inputDelayMs),

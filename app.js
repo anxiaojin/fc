@@ -1,6 +1,6 @@
 const SCREEN_WIDTH = 256;
 const SCREEN_HEIGHT = 240;
-const APP_VERSION = "v20260621-compat-core-4";
+const APP_VERSION = "v20260621-compat-state-3";
 const TARGET_FPS = 60;
 const FRAME_TIME = 1000 / TARGET_FPS;
 const TURBO_INTERVAL_MS = 80;
@@ -28,6 +28,8 @@ const ONLINE_CATCHUP_FRAMES_PER_TICK = 4;
 const AUTHORITATIVE_STATE_INTERVAL_FRAMES = 0;
 const STATE_HASH_INTERVAL_FRAMES = TARGET_FPS * 5;
 const FRAME_ACK_INTERVAL_FRAMES = 5;
+const COMPAT_INPUT_SNAPSHOT_DELAY_MS = 360;
+const COMPAT_INPUT_LATE_SNAPSHOT_DELAY_MS = 1600;
 const JSNES_SUPPORTED_MAPPERS = new Set([
   0, 1, 2, 3, 4, 5, 7, 11, 34, 38, 66, 94, 140, 180,
 ]);
@@ -131,6 +133,15 @@ let currentRomData = null;
 let currentRoomRom = null;
 let compatObjectUrl = "";
 let compatFrame = null;
+let compatReady = false;
+let compatReadyResolve = null;
+let compatReadyPromise = null;
+let compatRequestSeq = 0;
+let compatLoopPaused = false;
+let compatStepping = false;
+let compatInputSnapshotTimer = 0;
+let compatInputLateSnapshotTimer = 0;
+const compatRequests = new Map();
 
 const activeInputs = new Map();
 const keySources = new Map();
@@ -183,6 +194,7 @@ const sync = {
   snapshotFrames: 0,
   lastHashFrame: -1,
   lastAckFrame: -1,
+  core: "jsnes",
   started: false,
 };
 
@@ -340,11 +352,11 @@ function formatRomError(error) {
   const mapper = error?.romInfo?.mapper;
 
   if (error?.code === "JSNES_COMPAT_REQUIRED" && mapper !== undefined) {
-    return `该 ROM 需要兼容模式，联机暂不支持 ${romMapperLabel(error.romInfo)}`;
+    return `该 ROM 需要兼容模式：${romMapperLabel(error.romInfo)}`;
   }
 
   if (error?.code === "JSNES_UNSUPPORTED_MAPPER" && mapper !== undefined) {
-    return `不支持 Mapper ${mapper}，单机可用兼容模式`;
+    return `该 ROM 需要兼容模式：Mapper ${mapper}`;
   }
 
   const mapperMatch = message.match(/mapper not supported by JSNES:\s*(.+)$/i);
@@ -424,8 +436,27 @@ function requiresCompatCore(romInfo) {
   return romInfo.mapper === 2 && romInfo.chr8k === 0;
 }
 
+function romCoreFromInfo(romInfo) {
+  return requiresCompatCore(romInfo) ||
+    !JSNES_SUPPORTED_MAPPERS.has(romInfo?.mapper)
+    ? "compat"
+    : "jsnes";
+}
+
+function normalizeCore(core) {
+  return core === "compat" ? "compat" : "jsnes";
+}
+
 function localSource(source) {
   return /^(key|touch|gamepad):/.test(source);
+}
+
+function hasLoadedRuntime() {
+  return Boolean(nes || isCompatModeActive());
+}
+
+function isSyncCompatMode() {
+  return normalizeCore(sync.core) === "compat" || (isCompatModeActive() && !nes);
 }
 
 function roleText(role) {
@@ -514,7 +545,7 @@ function updateSyncUi() {
   els.roomInput.disabled = sync.connected;
   els.leaveRoomButton.hidden = !sync.connected;
   if (sync.connected) els.roomInput.value = sync.room;
-  updateControls(Boolean(nes));
+  updateControls(hasLoadedRuntime());
 }
 
 function drawBootScreen() {
@@ -547,6 +578,7 @@ function renderFrame(frameBuffer) {
 }
 
 function clearCompatMode() {
+  resetCompatBridge("compat-cleared");
   if (compatObjectUrl) {
     URL.revokeObjectURL(compatObjectUrl);
     compatObjectUrl = "";
@@ -561,6 +593,68 @@ function clearCompatMode() {
 
 function isCompatModeActive() {
   return Boolean(compatFrame && document.body.classList.contains("compat-mode"));
+}
+
+function resetCompatBridge(reason = "reset") {
+  compatReady = false;
+  compatLoopPaused = false;
+  compatStepping = false;
+  if (compatInputSnapshotTimer) {
+    window.clearTimeout(compatInputSnapshotTimer);
+    compatInputSnapshotTimer = 0;
+  }
+  if (compatInputLateSnapshotTimer) {
+    window.clearTimeout(compatInputLateSnapshotTimer);
+    compatInputLateSnapshotTimer = 0;
+  }
+  compatReadyResolve = null;
+  compatReadyPromise = null;
+  for (const pending of compatRequests.values()) {
+    window.clearTimeout(pending.timer);
+    pending.reject(new Error(reason));
+  }
+  compatRequests.clear();
+}
+
+function beginCompatBridgeLoad() {
+  resetCompatBridge("compat-reload");
+  compatReadyPromise = new Promise((resolve) => {
+    compatReadyResolve = resolve;
+  });
+}
+
+function markCompatReady() {
+  compatReady = true;
+  compatLoopPaused = false;
+  if (compatReadyResolve) {
+    compatReadyResolve();
+    compatReadyResolve = null;
+  }
+}
+
+function waitForCompatReady(timeoutMs = 10000) {
+  if (compatReady) return Promise.resolve(true);
+  if (!compatReadyPromise) {
+    compatReadyPromise = new Promise((resolve) => {
+      compatReadyResolve = resolve;
+    });
+  }
+
+  return new Promise((resolve, reject) => {
+    const timer = window.setTimeout(() => {
+      reject(new Error("Compatibility core did not start in time"));
+    }, timeoutMs);
+
+    compatReadyPromise
+      .then(() => {
+        window.clearTimeout(timer);
+        resolve(true);
+      })
+      .catch((error) => {
+        window.clearTimeout(timer);
+        reject(error);
+      });
+  });
 }
 
 function sendCompatInput(player, button, isDown) {
@@ -578,6 +672,67 @@ function sendCompatInput(player, button, isDown) {
     },
     "*",
   );
+}
+
+function compatRequest(command, payload = {}, timeoutMs = 5000) {
+  if (!compatFrame?.contentWindow) {
+    return Promise.reject(new Error("Compatibility frame unavailable"));
+  }
+
+  const requestId = `compat-${Date.now().toString(36)}-${++compatRequestSeq}`;
+  return new Promise((resolve, reject) => {
+    const timer = window.setTimeout(() => {
+      compatRequests.delete(requestId);
+      reject(new Error(`Compatibility command timed out: ${command}`));
+    }, timeoutMs);
+
+    compatRequests.set(requestId, { reject, resolve, timer });
+    compatFrame.contentWindow.postMessage(
+      {
+        type: "fc-compat-command",
+        command,
+        payload,
+        requestId,
+      },
+      "*",
+    );
+  });
+}
+
+function handleCompatResponse(message) {
+  const requestId = String(message?.requestId || "");
+  const pending = compatRequests.get(requestId);
+  if (!pending) return;
+
+  compatRequests.delete(requestId);
+  window.clearTimeout(pending.timer);
+  if (message.ok === false) {
+    pending.reject(new Error(String(message.error || "Compatibility command failed")));
+  } else {
+    pending.resolve(message.result);
+  }
+}
+
+async function pauseCompatCore() {
+  if (!isCompatModeActive() || compatLoopPaused) return;
+  try {
+    await waitForCompatReady(2000);
+    await compatRequest("pause", {}, 2000);
+    compatLoopPaused = true;
+  } catch (error) {
+    debugSync("compat-pause-failed", { error: String(error?.message || error) });
+  }
+}
+
+async function resumeCompatCore() {
+  if (!isCompatModeActive() || !compatLoopPaused) return;
+  try {
+    await waitForCompatReady(2000);
+    await compatRequest("resume", {}, 2000);
+    compatLoopPaused = false;
+  } catch (error) {
+    debugSync("compat-resume-failed", { error: String(error?.message || error) });
+  }
 }
 
 function scriptJson(value) {
@@ -613,6 +768,27 @@ function buildCompatHtml(gameUrl, label) {
         overflow: hidden;
         background: #050608;
       }
+      .ejs_menu_bar,
+      .ejs_menu_bar * ,
+      .ejs_context_menu,
+      .ejs_popup_container,
+      .ejs_popup_container *,
+      .ejs_menu_button,
+      .ejs_menu_text,
+      .ejs_virtualGamepad_parent,
+      .ejs_virtualGamepad_parent *,
+      [class*="ejs_virtualGamepad"],
+      [class*="ejs_virtualGamepad"] *,
+      [class*="ejs_context_menu"],
+      [class*="ejs_popup_container"] {
+        display: none !important;
+        opacity: 0 !important;
+        pointer-events: none !important;
+        visibility: hidden !important;
+      }
+      .ejs_canvas {
+        cursor: default !important;
+      }
     </style>
   </head>
   <body>
@@ -630,10 +806,80 @@ function buildCompatHtml(gameUrl, label) {
       window.EJS_disableAutoLang = false;
       window.EJS_startButtonName = "开始";
       window.EJS_alignStartButton = "center";
+      window.EJS_defaultOptions = {
+        "menu-bar-button": "disabled",
+        "virtual-gamepad": "disabled"
+      };
+      window.EJS_Buttons = {
+        cacheManager: false,
+        cheat: false,
+        contextMenu: false,
+        diskButton: false,
+        enterFullscreen: false,
+        exitEmulation: false,
+        exitFullscreen: false,
+        fullscreen: false,
+        gamepad: false,
+        loadSavFiles: false,
+        loadState: false,
+        mute: false,
+        pause: false,
+        play: false,
+        playPause: false,
+        quickLoad: false,
+        quickSave: false,
+        restart: false,
+        saveSavFiles: false,
+        saveState: false,
+        screenRecord: false,
+        screenshot: false,
+        settings: false,
+        unmute: false,
+        volumeSlider: false
+      };
       const compatPendingInputs = [];
+      const compatPendingCommands = [];
+      const bytesToBase64 = function (bytes) {
+        let binary = "";
+        const chunkSize = 0x8000;
+        for (let index = 0; index < bytes.length; index += chunkSize) {
+          binary += String.fromCharCode.apply(
+            null,
+            bytes.subarray(index, index + chunkSize)
+          );
+        }
+        return btoa(binary);
+      };
+      const base64ToBytes = function (base64) {
+        const binary = atob(base64);
+        const bytes = new Uint8Array(binary.length);
+        for (let index = 0; index < binary.length; index += 1) {
+          bytes[index] = binary.charCodeAt(index);
+        }
+        return bytes;
+      };
+      const compatManager = function () {
+        return window.EJS_emulator && window.EJS_emulator.gameManager;
+      };
+      const hideCompatUi = function () {
+        const selectors = [
+          ".ejs_menu_bar",
+          ".ejs_context_menu",
+          ".ejs_popup_container",
+          ".ejs_menu_button",
+          ".ejs_virtualGamepad_parent",
+          "[class*='ejs_virtualGamepad']"
+        ];
+        document.querySelectorAll(selectors.join(",")).forEach(function (node) {
+          node.style.setProperty("display", "none", "important");
+          node.style.setProperty("opacity", "0", "important");
+          node.style.setProperty("pointer-events", "none", "important");
+          node.style.setProperty("visibility", "hidden", "important");
+        });
+      };
       const applyCompatInput = function (payload) {
         if (!Number.isFinite(Number(payload.input))) return;
-        const manager = window.EJS_emulator && window.EJS_emulator.gameManager;
+        const manager = compatManager();
         if (!manager || typeof manager.simulateInput !== "function") {
           compatPendingInputs.push(payload);
           return;
@@ -641,15 +887,98 @@ function buildCompatHtml(gameUrl, label) {
         const player = Math.max(0, Math.min(3, Number(payload.player || 1) - 1));
         manager.simulateInput(player, Number(payload.input), payload.down ? 1 : 0);
       };
+      const respondCompatCommand = function (requestId, ok, result, error) {
+        parent.postMessage(
+          {
+            type: "fc-compat-response",
+            requestId: requestId || "",
+            ok: Boolean(ok),
+            result: result === undefined ? null : result,
+            error: error ? String(error) : "",
+          },
+          "*"
+        );
+      };
+      const handleCompatCommand = function (payload) {
+        const requestId = payload.requestId || "";
+        const command = String(payload.command || "");
+        const manager = compatManager();
+        if (!manager) {
+          compatPendingCommands.push(payload);
+          return;
+        }
+        try {
+          if (command === "get-state") {
+            if (typeof manager.getState !== "function") {
+              throw new Error("State capture unsupported");
+            }
+            respondCompatCommand(requestId, true, {
+              state: bytesToBase64(manager.getState()),
+            });
+            return;
+          }
+          if (command === "load-state") {
+            if (typeof manager.loadState !== "function") {
+              throw new Error("State load unsupported");
+            }
+            manager.loadState(base64ToBytes(payload.payload && payload.payload.state));
+            respondCompatCommand(requestId, true, { loaded: true });
+            return;
+          }
+          if (command === "get-frame") {
+            respondCompatCommand(requestId, true, {
+              frame:
+                typeof manager.getFrameNum === "function"
+                  ? Math.max(0, Number(manager.getFrameNum()) || 0)
+                  : 0,
+            });
+            return;
+          }
+          if (command === "pause") {
+            if (typeof manager.toggleMainLoop === "function") {
+              manager.toggleMainLoop(0);
+            }
+            respondCompatCommand(requestId, true, { paused: true });
+            return;
+          }
+          if (command === "resume") {
+            if (typeof manager.toggleMainLoop === "function") {
+              manager.toggleMainLoop(1);
+            }
+            respondCompatCommand(requestId, true, { paused: false });
+            return;
+          }
+          throw new Error("Unknown command: " + command);
+        } catch (error) {
+          respondCompatCommand(requestId, false, null, error && error.message ? error.message : error);
+        }
+      };
+      const flushCompatQueues = function () {
+        compatPendingInputs.splice(0).forEach(applyCompatInput);
+        compatPendingCommands.splice(0).forEach(handleCompatCommand);
+      };
       window.addEventListener("message", function (event) {
         const payload = event.data || {};
-        if (payload.type !== "fc-compat-input") return;
-        applyCompatInput(payload);
+        if (payload.type === "fc-compat-input") {
+          applyCompatInput(payload);
+          return;
+        }
+        if (payload.type === "fc-compat-command") {
+          handleCompatCommand(payload);
+        }
       });
       window.EJS_onGameStart = function () {
         parent.postMessage({ type: "fc-compat-started" }, "*");
-        compatPendingInputs.splice(0).forEach(applyCompatInput);
+        hideCompatUi();
+        flushCompatQueues();
       };
+      new MutationObserver(hideCompatUi).observe(document.body, {
+        attributes: true,
+        childList: true,
+        subtree: true
+      });
+      window.setInterval(hideCompatUi, 750);
+      hideCompatUi();
     </script>
     <script src="${dataUrl}loader.js"></script>
   </body>
@@ -664,6 +993,7 @@ async function loadCompatRomBuffer(buffer, label, romInfo = null) {
   stopEmulation("切换兼容模式");
   releaseAllInputs();
   clearCompatMode();
+  beginCompatBridgeLoad();
   audio?.reset();
   nes = null;
   running = false;
@@ -816,8 +1146,17 @@ function captureSyncState() {
   return state;
 }
 
+async function captureSyncStateAsync() {
+  if (isSyncCompatMode()) {
+    await waitForCompatReady(5000);
+    const result = await compatRequest("get-state", {}, 8000);
+    return result?.state || null;
+  }
+  return captureSyncState();
+}
+
 function hashSyncState(state) {
-  return hashString(JSON.stringify(state));
+  return typeof state === "string" ? hashString(state) : hashString(JSON.stringify(state));
 }
 
 function getInputKey(player, button) {
@@ -875,7 +1214,34 @@ function handleLocalSyncInput(player, button, isDown, source, options = {}) {
     syncButtonVisual(player, button, isActive);
   }
   sendSync({ type: "input", button, down: isActive });
+  scheduleCompatInputSnapshot("compat-input");
   requestResyncIfNeeded();
+}
+
+function scheduleCompatInputSnapshot(reason = "compat-input") {
+  if (
+    !isSyncCompatMode() ||
+    !sync.connected ||
+    !sync.started ||
+    sync.role < 1
+  ) {
+    return;
+  }
+
+  if (compatInputSnapshotTimer) {
+    window.clearTimeout(compatInputSnapshotTimer);
+  }
+  if (compatInputLateSnapshotTimer) {
+    window.clearTimeout(compatInputLateSnapshotTimer);
+  }
+  compatInputSnapshotTimer = window.setTimeout(() => {
+    compatInputSnapshotTimer = 0;
+    void sendSyncSnapshot(reason);
+  }, COMPAT_INPUT_SNAPSHOT_DELAY_MS);
+  compatInputLateSnapshotTimer = window.setTimeout(() => {
+    compatInputLateSnapshotTimer = 0;
+    void sendSyncSnapshot(`${reason}-late`);
+  }, COMPAT_INPUT_LATE_SNAPSHOT_DELAY_MS);
 }
 
 function releaseLocalSyncInputs() {
@@ -1022,11 +1388,12 @@ function releaseAllInputs() {
 
 function updateControls(hasRom) {
   const online = sync.connected;
-  els.runButton.disabled = !hasRom || online;
-  els.resetButton.disabled = !hasRom || online;
-  els.saveButton.disabled = !hasRom || online;
+  const canUseJsnesControls = Boolean(nes);
+  els.runButton.disabled = !canUseJsnesControls || online;
+  els.resetButton.disabled = !canUseJsnesControls || online;
+  els.saveButton.disabled = !canUseJsnesControls || online;
   els.loadButton.disabled =
-    !hasRom || online || !localStorage.getItem(currentRomKey);
+    !canUseJsnesControls || online || !localStorage.getItem(currentRomKey);
   els.runButton.textContent = running ? "Ⅱ" : "▶";
 }
 
@@ -1045,28 +1412,52 @@ function startEmulation(status = "运行中") {
   rafId = requestAnimationFrame(tick);
 }
 
+function startCompatOnline(status = "同步中") {
+  if (!isCompatModeActive() || running) {
+    return;
+  }
+
+  running = true;
+  lastFrameAt = performance.now() - FRAME_TIME;
+  fpsStartedAt = performance.now();
+  framesThisSecond = 0;
+  updateControls(true);
+  setStatus(status);
+  void resumeAudio();
+  void resumeCompatCore();
+  rafId = requestAnimationFrame(tick);
+}
+
 function stopEmulation(status = "已暂停") {
   running = false;
   if (rafId) {
     cancelAnimationFrame(rafId);
     rafId = 0;
   }
-  updateControls(Boolean(nes));
-  if (nes) {
+  updateControls(hasLoadedRuntime());
+  if (isCompatModeActive()) {
+    void pauseCompatCore();
+  }
+  if (nes || isCompatModeActive()) {
     setStatus(status);
   }
 }
 
 function tick(now) {
-  if (!running || !nes) {
+  if (!running) {
     return;
   }
 
   pollGamepads();
 
   if (sync.connected && sync.started) {
-    tickOnline();
+    tickOnline(now);
     updateFps(now);
+    return;
+  }
+
+  if (!nes) {
+    rafId = requestAnimationFrame(tick);
     return;
   }
 
@@ -1187,8 +1578,9 @@ async function loadRomBuffer(buffer, label, options = {}) {
   return { compat: false, romInfo };
 }
 
-function rememberCurrentRomFromBuffer(buffer, label) {
+function rememberCurrentRomFromBuffer(buffer, label, core = "jsnes") {
   currentRoomRom = {
+    core: normalizeCore(core),
     data: arrayBufferToBase64(buffer),
     label,
     mode: "data",
@@ -1196,8 +1588,9 @@ function rememberCurrentRomFromBuffer(buffer, label) {
   };
 }
 
-function rememberCurrentRomFromUrl(url, label) {
+function rememberCurrentRomFromUrl(url, label, core = "jsnes") {
   currentRoomRom = {
+    core: normalizeCore(core),
     label,
     mode: "url",
     url,
@@ -1234,9 +1627,11 @@ async function loadRomFile(file) {
     const result = await loadRomBuffer(buffer, file.name, {
       allowCompat: true,
     });
-    if (!result.compat) {
-      rememberCurrentRomFromBuffer(buffer, file.name);
-    }
+    rememberCurrentRomFromBuffer(
+      buffer,
+      file.name,
+      result.compat ? "compat" : "jsnes",
+    );
   } catch (error) {
     console.error(error);
     nes = null;
@@ -1271,9 +1666,7 @@ async function loadBundledRom(url, label) {
     const result = await loadRomBuffer(buffer, label, {
       allowCompat: true,
     });
-    if (!result.compat) {
-      rememberCurrentRomFromUrl(url, label);
-    }
+    rememberCurrentRomFromUrl(url, label, result.compat ? "compat" : "jsnes");
   } catch (error) {
     console.error(error);
     nes = null;
@@ -1391,6 +1784,17 @@ function resetSyncFrameState() {
   clearSyncStateWait();
   sync.resyncRequestedAt = 0;
   sync.lastHashFrame = -1;
+  sync.lastSnapshotSentAt = 0;
+  sync.lastSnapshotSentFrame = -1;
+  sync.snapshotFrames = 0;
+  if (compatInputSnapshotTimer) {
+    window.clearTimeout(compatInputSnapshotTimer);
+    compatInputSnapshotTimer = 0;
+  }
+  if (compatInputLateSnapshotTimer) {
+    window.clearTimeout(compatInputLateSnapshotTimer);
+    compatInputLateSnapshotTimer = 0;
+  }
 }
 
 function makePingId() {
@@ -1530,6 +1934,7 @@ function resetSyncState(message = "未进入房间", options = {}) {
   sync.lastHashFrame = -1;
   sync.lastAckFrame = -1;
   sync.resyncRequestedAt = 0;
+  sync.core = "jsnes";
   sync.started = false;
   if (remembered) els.roomInput.value = remembered;
   els.syncRoleLabel.textContent = message;
@@ -1641,8 +2046,8 @@ function selectRoomRom(url, label) {
 
   stopEmulation("通知房间");
   releaseAllInputs();
-  rememberCurrentRomFromUrl(url, label);
-  sendSync({ type: "select-rom", url, label });
+  rememberCurrentRomFromUrl(url, label, "jsnes");
+  sendSync({ type: "select-rom", core: "jsnes", url, label });
 }
 
 async function selectRoomRomFile(file) {
@@ -1658,27 +2063,11 @@ async function selectRoomRomFile(file) {
   try {
     const buffer = await file.arrayBuffer();
     const romInfo = parseRomInfo(buffer);
-    if (requiresCompatCore(romInfo)) {
-      throw makeRomError(
-        `Online sync does not support compatibility-core ROMs: ${romMapperLabel(
-          romInfo,
-        )}`,
-        "JSNES_COMPAT_REQUIRED",
-        romInfo,
-      );
-    }
-
-    if (!JSNES_SUPPORTED_MAPPERS.has(romInfo.mapper)) {
-      throw makeRomError(
-        `Online sync does not support ${romMapperLabel(romInfo)}`,
-        "JSNES_UNSUPPORTED_MAPPER",
-        romInfo,
-      );
-    }
-
-    rememberCurrentRomFromBuffer(buffer, file.name);
+    const core = romCoreFromInfo(romInfo);
+    rememberCurrentRomFromBuffer(buffer, file.name, core);
     sendSync({
       type: "select-rom-data",
+      core,
       data: arrayBufferToBase64(buffer),
       label: file.name,
       size: buffer.byteLength,
@@ -1697,11 +2086,13 @@ async function loadRoomRom(message) {
   const roomWasStarted = Boolean(message.started);
   const roomWasPaused = Boolean(message.paused);
   const needsState = roomWasStarted || Boolean(message.needsState);
+  const requestedCore = normalizeCore(message.core || "jsnes");
   stopEmulation("同步载入中");
   releaseAllInputs();
   resetSyncFrameState();
   setLibraryBusy(true);
   sync.started = false;
+  sync.core = requestedCore;
   updateSyncUi();
 
   try {
@@ -1710,19 +2101,35 @@ async function loadRoomRom(message) {
         ? base64ToArrayBuffer(message.data)
         : await fetchRomBuffer(message.url);
     setRomKeyFromLabel(`${sync.room}-${label}`, buffer.byteLength);
-    await loadRomBuffer(buffer, label, {
-      autoStart: false,
-      status: "已加载，等待同步开始",
-    });
+    let loadedCore = requestedCore;
+    if (requestedCore === "compat") {
+      await loadCompatRomBuffer(buffer, label, parseRomInfo(buffer));
+      await waitForCompatReady(15000);
+      await pauseCompatCore();
+      loadedCore = "compat";
+    } else {
+      const result = await loadRomBuffer(buffer, label, {
+        allowCompat: true,
+        autoStart: false,
+        status: "已加载，等待同步开始",
+      });
+      loadedCore = result.compat ? "compat" : "jsnes";
+      if (loadedCore === "compat") {
+        await waitForCompatReady(15000);
+        await pauseCompatCore();
+      }
+    }
+    sync.core = loadedCore;
     if (message.mode === "data" || message.data) {
       currentRoomRom = {
+        core: loadedCore,
         data: message.data,
         label,
         mode: "data",
         size: Number(message.size) || buffer.byteLength,
       };
     } else {
-      rememberCurrentRomFromUrl(message.url, label);
+      rememberCurrentRomFromUrl(message.url, label, loadedCore);
     }
     sync.started = roomWasStarted;
     sync.paused = roomWasPaused;
@@ -1731,8 +2138,11 @@ async function loadRoomRom(message) {
     }
     updateSyncUi();
     if (sync.pendingState) {
-      applySyncState(sync.pendingState);
+      await applySyncState(sync.pendingState);
       sync.pendingState = null;
+    }
+    if (loadedCore === "compat" && sync.role === 1 && !needsState) {
+      await sendSyncSnapshot("compat-ready");
     }
     sendSync({ type: "ready" });
     if (needsState && sync.awaitingState) {
@@ -1773,9 +2183,13 @@ function startSynchronizedGame(message = {}) {
   updateSyncUi();
   setStatus("同步倒计时");
   setTimeout(() => {
-    if (!nes || sync.paused || document.hidden) return;
+    if (!hasLoadedRuntime() || sync.paused || document.hidden) return;
     sync.snapshotFrames = 0;
-    startEmulation("同步中");
+    if (isSyncCompatMode()) {
+      startCompatOnline("同步中");
+    } else {
+      startEmulation("同步中");
+    }
   }, Math.max(0, delayMs));
 }
 
@@ -1825,7 +2239,7 @@ function storeSyncInputFrames(message) {
 
 function applySyncInputMask(player, mask) {
   for (const button of BUTTON_ORDER) {
-    if (BUTTONS[button] === undefined) continue;
+    if (!isCompatModeActive() && BUTTONS[button] === undefined) continue;
     setButton(
       player,
       button,
@@ -1913,7 +2327,80 @@ function stepNesFrame() {
   framesThisSecond += 1;
 }
 
-function tickOnline() {
+function stepCompatSyncFrame() {
+  if (sync.connected && sync.started) {
+    sync.frame += 1;
+    if (sync.frame % FRAME_ACK_INTERVAL_FRAMES === 0) {
+      sendFrameAck("frame");
+    }
+  }
+  framesThisSecond += 1;
+}
+
+function tickCompatOnline(now = performance.now()) {
+  if (sync.paused || waitForSyncState()) {
+    void pauseCompatCore();
+    rafId = requestAnimationFrame(tick);
+    return;
+  }
+
+  const backlog = contiguousSyncInputFrames();
+  if (backlog === 0 && maxBufferedInputFrame() > sync.frame) {
+    void pauseCompatCore();
+    requestResyncIfNeeded(true);
+    rafId = requestAnimationFrame(tick);
+    return;
+  }
+
+  if (backlog > RESYNC_BACKLOG_FRAMES) {
+    requestResyncIfNeeded(true, false);
+  }
+
+  if (backlog === 0) {
+    void pauseCompatCore();
+    setStatus(sync.stalled ? "等待对方网络" : "等待同步数据");
+    rafId = requestAnimationFrame(tick);
+    return;
+  }
+
+  void resumeCompatCore();
+  if (now - lastFrameAt > 250) {
+    lastFrameAt = now - FRAME_TIME;
+  }
+
+  const maxSteps =
+    backlog > ONLINE_CATCHUP_BACKLOG_FRAMES
+      ? ONLINE_CATCHUP_FRAMES_PER_TICK
+      : ONLINE_STEADY_FRAMES_PER_TICK;
+  const dueSteps = Math.max(1, Math.floor((now - lastFrameAt) / FRAME_TIME));
+  const steps = Math.min(backlog, maxSteps, dueSteps);
+  let stepped = 0;
+  for (let index = 0; index < steps; index += 1) {
+    if (!applyNextSyncInputFrame()) break;
+    stepCompatSyncFrame();
+    lastFrameAt += FRAME_TIME;
+    stepped += 1;
+  }
+
+  if (stepped > 0) {
+    if (
+      els.statusText.textContent === "等待同步数据" ||
+      els.statusText.textContent === "等待对方网络" ||
+      els.statusText.textContent === "已同步最新状态"
+    ) {
+      setStatus("同步中");
+    }
+  }
+
+  rafId = requestAnimationFrame(tick);
+}
+
+function tickOnline(now = performance.now()) {
+  if (isSyncCompatMode()) {
+    tickCompatOnline(now);
+    return;
+  }
+
   if (sync.paused || waitForSyncState()) {
     rafId = requestAnimationFrame(tick);
     return;
@@ -2042,7 +2529,7 @@ function pruneSyncInputFrames(frame) {
   }
 }
 
-function applySyncState(message) {
+async function applySyncState(message) {
   const fromSelf = Boolean(message?.from && message.from === sync.clientId);
   if (
     fromSelf &&
@@ -2058,7 +2545,12 @@ function applySyncState(message) {
   if (!sync.connected || !state) {
     return;
   }
-  if (!nes) {
+  if (isSyncCompatMode()) {
+    if (!isCompatModeActive()) {
+      sync.pendingState = message;
+      return;
+    }
+  } else if (!nes) {
     sync.pendingState = message;
     return;
   }
@@ -2067,6 +2559,7 @@ function applySyncState(message) {
   }
   const reason = String(message.reason || "");
   const authoritative = Boolean(message.authoritative) || reason === "authoritative";
+  const stateCore = normalizeCore(message.core || sync.core);
   const canApplyOlderState = Boolean(message.realign);
   const stateKey = message.stateSeq
     ? `seq:${message.stateSeq}`
@@ -2084,7 +2577,8 @@ function applySyncState(message) {
     sync.awaitingState ||
     sync.paused ||
     reason === "hash-mismatch" ||
-    reason === "history-gap";
+    reason === "history-gap" ||
+    (stateCore === "compat" && canApplyOlderState);
   if (frame < sync.frame && (!canApplyOlderState || !mustRealign)) {
     debugSync("state-skip-stale", {
       authoritative,
@@ -2109,8 +2603,22 @@ function applySyncState(message) {
 
   try {
     const localFrameBeforeApply = sync.frame;
-    state.romData = currentRomData;
-    nes.fromJSON(state);
+    if (isSyncCompatMode()) {
+      if (typeof state !== "string") {
+        debugSync("state-skip-invalid-compat", {
+          frame,
+          reason,
+          stateType: typeof state,
+        });
+        return;
+      }
+      await waitForCompatReady(8000);
+      await pauseCompatCore();
+      await compatRequest("load-state", { state }, 8000);
+    } else {
+      state.romData = currentRomData;
+      nes.fromJSON(state);
+    }
     sync.frame = frame;
     sync.lastAppliedStateKey = stateKey;
     sync.lastServerFrame = Math.max(sync.lastServerFrame, frame);
@@ -2141,28 +2649,46 @@ function applySyncState(message) {
     });
     setStatus("已同步最新状态");
     if (
+      isSyncCompatMode() &&
+      running &&
+      sync.started &&
+      !sync.paused &&
+      !sync.awaitingState &&
+      !document.hidden
+    ) {
+      void resumeCompatCore();
+    }
+    if (
       sync.started &&
       !running &&
       !sync.paused &&
       !sync.awaitingState &&
       !document.hidden
     ) {
-      startEmulation("同步中");
+      if (isSyncCompatMode()) {
+        startCompatOnline("同步中");
+      } else {
+        startEmulation("同步中");
+      }
     }
   } catch (error) {
     console.warn(error);
   }
 }
 
-function sendSyncSnapshot(reason = "resync", to = "") {
-  if (!sync.connected || sync.role < 1 || !nes) return;
+async function sendSyncSnapshot(reason = "resync", to = "") {
+  if (!sync.connected || sync.role < 1 || !hasLoadedRuntime()) return;
 
   try {
     const now = performance.now();
+    const isCompatSnapshot = isSyncCompatMode();
+    const isCompatInputSnapshot = String(reason).startsWith("compat-input");
+    const minSnapshotInterval = isCompatInputSnapshot ? 300 : 1500;
     if (
       sync.lastSnapshotSentAt > 0 &&
-      now - sync.lastSnapshotSentAt < 1500 &&
-      Math.abs(sync.frame - sync.lastSnapshotSentFrame) <= 5
+      now - sync.lastSnapshotSentAt < minSnapshotInterval &&
+      Math.abs(sync.frame - sync.lastSnapshotSentFrame) <=
+        (isCompatSnapshot ? 1 : 5)
     ) {
       debugSync("state-skip-duplicate", {
         frame: sync.frame,
@@ -2172,9 +2698,11 @@ function sendSyncSnapshot(reason = "resync", to = "") {
       return;
     }
 
-    const state = captureSyncState();
+    const state = await captureSyncStateAsync();
+    if (!state) return;
     const hash = hashSyncState(state);
     debugSync("state-send", {
+      core: isSyncCompatMode() ? "compat" : "jsnes",
       frame: sync.frame,
       hash,
       reason,
@@ -2182,7 +2710,14 @@ function sendSyncSnapshot(reason = "resync", to = "") {
     });
     sync.lastSnapshotSentAt = now;
     sync.lastSnapshotSentFrame = sync.frame;
-    const message = { type: "state", frame: sync.frame, hash, reason, state };
+    const message = {
+      type: "state",
+      core: isSyncCompatMode() ? "compat" : "jsnes",
+      frame: sync.frame,
+      hash,
+      reason,
+      state,
+    };
     if (to) message.to = String(to);
     sendSync(message);
   } catch (error) {
@@ -2266,7 +2801,9 @@ function resumeSynchronizedGame() {
   if (sync.awaitingState) {
     return;
   }
-  if (nes && sync.started && !running && !document.hidden) {
+  if (isSyncCompatMode() && sync.started && !running && !document.hidden) {
+    startCompatOnline("同步中");
+  } else if (nes && sync.started && !running && !document.hidden) {
     startEmulation("同步中");
   }
 }
@@ -2376,7 +2913,7 @@ function handleSyncMessage(raw) {
   }
 
   if (message.type === "state") {
-    applySyncState(message);
+    void applySyncState(message);
     return;
   }
 
@@ -2396,12 +2933,12 @@ function handleSyncMessage(raw) {
   }
 
   if (message.type === "resync-request") {
-    sendSyncSnapshot("resync");
+    void sendSyncSnapshot("resync");
     return;
   }
 
   if (message.type === "state-request") {
-    sendSyncSnapshot(message.reason || "resync", message.to || "");
+    void sendSyncSnapshot(message.reason || "resync", message.to || "");
     return;
   }
 
@@ -2817,7 +3354,7 @@ function handleVisibilityChange() {
     keySources.clear();
     gamepadSources[1].clear();
     gamepadSources[2].clear();
-    sendSyncSnapshot("background");
+    void sendSyncSnapshot("background");
     pauseSynchronizedGame();
   } else {
     resumeSyncAfterForeground("visibility");
@@ -2834,7 +3371,7 @@ function handlePageHide() {
 
   sync.pendingPings.clear();
   releaseLocalSyncInputs();
-  sendSyncSnapshot("background");
+  void sendSyncSnapshot("background");
   sendSync({ type: "visibility", visible: false, frame: sync.frame });
 }
 
@@ -2861,7 +3398,18 @@ function bindUi() {
       event.source === compatFrame.contentWindow &&
       event.data?.type === "fc-compat-started"
     ) {
-      setStatus("兼容模式运行中");
+      markCompatReady();
+      if (!sync.connected) {
+        setStatus("兼容模式运行中");
+      }
+      return;
+    }
+    if (
+      compatFrame &&
+      event.source === compatFrame.contentWindow &&
+      event.data?.type === "fc-compat-response"
+    ) {
+      handleCompatResponse(event.data);
     }
   });
 
